@@ -2,7 +2,7 @@ pub mod internal_types {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
-    #[derive(Deserialize, Serialize, Clone, PartialEq)]
+    #[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
     pub struct NotificationInformation {
         pub read: bool,
         pub title: String,
@@ -12,14 +12,14 @@ pub mod internal_types {
         pub remove_by: String,
     }
 
-    #[derive(Deserialize, Serialize, Clone, PartialEq)]
+    #[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
     pub struct DeviceInformation {
         pub device_name: String,
         pub device_id: String,
         pub ps_data: HashMap<String, (Vec<u8>, String)>,
     }
 
-    #[derive(Deserialize, Serialize, Clone, PartialEq)]
+    #[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
     pub struct UserInformation {
         pub username: String,
         pub pfp: String,
@@ -33,7 +33,7 @@ pub mod internal_types {
         pub secret: String,
     }
 
-    #[derive(Deserialize, Serialize, Clone, PartialEq)]
+    #[derive(Deserialize, Serialize, Clone, PartialEq, Debug)]
     pub struct UsernameMap {
         pub owner_id: String,
     }
@@ -58,6 +58,12 @@ pub mod recieveable_types {
         pub username: String,
         pub password: String,
         pub requested_scopes: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct DeleteAccountProps {
+        pub username: String,
+        pub password: String,
     }
 
     #[derive(Deserialize)]

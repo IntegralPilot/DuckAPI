@@ -350,6 +350,29 @@ async fn get_most_recent_monday() -> String {
     )
 }
 
+async fn get_next_monday() -> String {
+    let local_date = Local::now().date_naive();
+    let weekday = local_date.weekday();
+    let days_to_add = match weekday {
+        Weekday::Mon => 7,
+        Weekday::Tue => 6,
+        Weekday::Wed => 5,
+        Weekday::Thu => 4,
+        Weekday::Fri => 3,
+        Weekday::Sat => 2,
+        Weekday::Sun => 1,
+    };
+
+    let next_monday = local_date + Duration::days(days_to_add.into());
+
+    format!(
+        "{:02}-{:02}-{}",
+        next_monday.day(),
+        next_monday.month(),
+        next_monday.year()
+    )
+}
+
 async fn read_or_create_file(folder_name: &str) -> Result<(date_reporting_info, String), String> {
     let formatted_date = get_current_dd_mm_yyyy().await;
     let dir = data_dir().unwrap();
@@ -465,17 +488,60 @@ async fn convert_devices(
     for d in devices {
         let mut labels_vec: Vec<String> = vec![];
         let mut values_vec: Vec<u8> = vec![];
-        for (label, value) in d.ps_data {
-            let value = value.0;
+        // prder the ps_data by the value.0
+        // value.0 is a date in yyyy-mm-dd format, order from earliest to latest
+        // if two values of value.0 fall on the same date, order by the label in this order: M, Tu, W, Th, F, Sa, Su, <anything else>
+        let mut ordered_ps_data: Vec<(&String, &(Vec<u8>, String))> = d.ps_data.iter().collect();
+        ordered_ps_data.sort_by(|a, b| {
+            let a_date = NaiveDate::parse_from_str(a.1.1.as_str(), "%d-%m-%Y").unwrap();
+            let b_date = NaiveDate::parse_from_str(b.1.1.as_str(), "%d-%m-%Y").unwrap();
+            if a_date < b_date {
+                return std::cmp::Ordering::Less;
+            } else if a_date > b_date {
+                return std::cmp::Ordering::Greater;
+            } else {
+                let a_label = a.0;
+                let b_label = b.0;
+                let a_order = match a_label.as_str() {
+                    "M" => 0,
+                    "Tu" => 1,
+                    "W" => 2,
+                    "Th" => 3,
+                    "F" => 4,
+                    "Sa" => 5,
+                    "Su" => 6,
+                    _ => 7,
+                };
+                let b_order = match b_label.as_str() {
+                    "M" => 0,
+                    "Tu" => 1,
+                    "W" => 2,
+                    "Th" => 3,
+                    "F" => 4,
+                    "Sa" => 5,
+                    "Su" => 6,
+                    _ => 7,
+                };
+                if a_order < b_order {
+                    return std::cmp::Ordering::Less;
+                } else if a_order > b_order {
+                    return std::cmp::Ordering::Greater;
+                } else {
+                    return std::cmp::Ordering::Equal;
+                }
+            }
+        });
+        for (label, value) in ordered_ps_data {
+            let value = &value.0;
             // get the average of the values
             let mut sum = 0;
-            for v in &value {
+            for v in value {
                 sum += v;
             }
             let average = sum / value.len() as u8;
             // round down to the nearest 1
             let rounded = average - (average % 1);
-            labels_vec.push(label);
+            labels_vec.push(label.to_string());
             values_vec.push(rounded);
         }
         return_vec.push(ProcessedDeviceInformation {
@@ -526,19 +592,167 @@ async fn convert_notifcations(
     return Ok(return_vec);
 }
 
+async fn find_avg_power_saving_of_device(device_info: DeviceInformation) -> usize {
+    let mut sum = 0usize;
+    let mut count = 0usize;
+    for (_, (values, _)) in device_info.ps_data.iter() {
+        for v in values {
+            sum += *v as usize;
+            count += 1;
+        }
+    }
+    let average = sum / count;
+    average
+}
+
+async fn find_avg_power_saving_of_entire_user(user_info: UserInformation) -> usize {
+    let mut sum = 0usize;
+    let mut count = 0usize;
+    for d in user_info.devices {
+        let device_avg = find_avg_power_saving_of_device(d).await;
+        sum += device_avg;
+        count += 1;
+    }
+    let average = sum / count;
+    average
+}
+
+pub async fn generate_notification(user_info: UserInformation) -> Result<UserInformation, String> {
+    let mut user_info = user_info.clone();
+    // Notification Types:
+    // 1. Feature Highlight (i.e. "Have you tried adding friends?")
+    // 2. Device Highlight (i.e. "Your device 'School Laptop' has saved on average 20% power with DuckPowered. Keep it up!")
+    // 3. Friend Highlight (i.e. "Your friend 'John' has saved on average 20% power with DuckPowered. Keep it up!")
+
+    // gen a random number between 1 and 3 to figure out the type
+    let notification_type = rand::random::<u8>() % 3 + 1;
+    match notification_type {
+        1 => {
+            // Feature Highlight
+            // Features that can be highlighted:
+            // Feature #1: Adding Friends
+            //             Title: "The more the merrier!"
+            //             Body: "Invite your friends to DuckPowered and save power together with in-app collaboration!"
+            // Feature #2: Getting DuckPowered on more devices
+            //             Title: "DuckPowered Everywhere!"
+            //             Body: "Get DuckPowered on all your devices to save power whereever you go!"
+            // Feature #3: Using in-app graphs to track power usage
+            //             Title: "Graphs Galore!"
+            //             Body: "Use DuckPowered's in-app graphs to track your power usage over time and gain poweful insights!"
+
+            let feature_index = rand::random::<u8>() % 3 + 1;
+
+            let notification = match feature_index {
+                1 => NotificationInformation {
+                    read: false,
+                    title: String::from("The more the merrier! 🌟"),
+                    info: String::from(
+                        "Invite your friends to DuckPowered and save power together with in-app collaboration!",
+                    ),
+                    from_user_id: String::from("DuckPowered"),
+                    remove_by: get_next_monday().await,
+                    uid: rng_alphanumeric(10usize).await,
+                },
+                2 => NotificationInformation {
+                    read: false,
+                    title: String::from("DuckPowered Everywhere! 🌍"),
+                    info: String::from(
+                        "Get DuckPowered on all your devices to save power whereever you go!",
+                    ),
+                    from_user_id: String::from("DuckPowered"),
+                    remove_by: get_next_monday().await,
+                    uid: rng_alphanumeric(10usize).await,
+                },
+                3 => NotificationInformation {
+                    read: false,
+                    title: String::from("Graphs Galore! 📊"),
+                    info: String::from(
+                        "Use DuckPowered's in-app graphs to track your power usage over time and gain poweful insights!",
+                    ),
+                    from_user_id: String::from("DuckPowered"),
+                    remove_by: get_next_monday().await,
+                    uid: rng_alphanumeric(10usize).await,
+                },
+                _ => return Err(String::from("The feature index was out of bounds.")),
+            };
+
+            user_info.notifications.push(notification);
+        }
+        2 => {
+            // Device Highlight
+            let device_index = rand::random::<usize>() % user_info.devices.len();
+            let device = &user_info.devices[device_index];
+            let notification = NotificationInformation {
+                read: false,
+                title: String::from("Device Highlight 💻"),
+                info: format!(
+                    "On the device '{}', you've reduced your power consumption by {}% with DuckPowered. Keep it up!",
+                    device.clone().device_name,
+                    find_avg_power_saving_of_device(device.clone()).await
+                ),
+                from_user_id: String::from("DuckPowered"),
+                remove_by: get_next_monday().await,
+                uid: rng_alphanumeric(10usize).await,
+            };
+            user_info.notifications.push(notification);
+        }
+        3 => {
+            // Friend Highlight
+
+            if user_info.friends.len() == 0 {
+                let notification = NotificationInformation {
+                    read: false,
+                    title: String::from("Save power together! 🌟"),
+                    info: String::from("Have you tried adding friends to DuckPowered?"),
+                    from_user_id: String::from("DuckPowered"),
+                    remove_by: get_next_monday().await,
+                    uid: rng_alphanumeric(10usize).await,
+                };
+                user_info.notifications.push(notification);
+                return Ok(user_info);
+            }
+
+            let friend_index = rand::random::<usize>() % user_info.friends.len();
+            let friend_info = match get_user_info_from_id(user_info.friends[friend_index].owner_id.as_str()).await {
+                Ok(info) => info,
+                Err(_) => {
+                    let notification = NotificationInformation {
+                        read: false,
+                        title: String::from("Save power together! 🌟"),
+                        info: String::from("Friends don't let friends waste power! Invite your friends to DuckPowered today!"),
+                        from_user_id: String::from("DuckPowered"),
+                        remove_by: get_next_monday().await,
+                        uid: rng_alphanumeric(10usize).await,
+                    };
+                    user_info.notifications.push(notification);
+                    return Ok(user_info);
+                }
+            };
+            
+            let notification = NotificationInformation {
+                read: false,
+                title: String::from("Friend Highlight ✨"),
+                info: format!(
+                    "Your friend '{}' has saved on average {}% power with DuckPowered. Let them know how well they're doing!",
+                    friend_info.clone().username,
+                    find_avg_power_saving_of_entire_user(friend_info.clone()).await
+                ),
+                from_user_id: friend_info.user_id,
+                remove_by: get_next_monday().await,
+                uid: rng_alphanumeric(10usize).await,
+            };
+            user_info.notifications.push(notification);
+        }
+        _ => return Err(String::from("The notification type was out of bounds.")),
+    }
+    return Ok(user_info);
+}
+
 pub async fn collate_user_information_public(
     user_id: String,
-    gen_notifcations: bool,
 ) -> Result<ExpandedStrippedUserInformation, String> {
     match get_user_info_from_id(user_id.as_str()).await {
         Ok(_) => {
-            // let's gen some notifcations!! give a mutable borrow to gen_notifcations so that it can mutate our notifcations parameter
-            match gen_notifcations {
-                true => {
-                    unimplemented!("Notification generation not implemented yet")
-                }
-                false => (),
-            }
             match get_user_info_from_id(user_id.as_str()).await {
                 Ok(info) => {
                     let mut friends_vec: Vec<StrippedUserInformation> = vec![];
@@ -597,8 +811,26 @@ pub async fn remove_friend(user_info: UserInformation, friend_code: &str) -> Res
     // Remove the friend from the user's friend list
     toy_info.friends.remove(friend_index);
 
-    write_user_info_to_file(toy_info, false).await?;
+    write_user_info_to_file(toy_info.clone(), false).await?;
 
+    // Remove the user from the friend's friend list
+    let friend_info = match get_user_info_from_id(friend_id.as_str()).await {
+        Ok(info) => info,
+        Err(e) => return Err(e),
+    };
+
+    let user_id = toy_info.user_id.clone();
+    let user_index = friend_info
+        .friends
+        .iter()
+        .position(|f| f.owner_id == user_id)
+        .ok_or_else(|| format!("404"))?;
+
+    let mut friend_info = friend_info.clone();
+    friend_info.friends.remove(user_index);
+
+    write_user_info_to_file(friend_info.clone(), false).await?;
+    
     Ok(())
 }
 
@@ -644,7 +876,6 @@ pub async fn insert_into_device_ps_data(
             let most_recent_monday = get_most_recent_monday().await;
             // see if the day is already in the device's ps_data
             let day_index = toy_info.devices[index].ps_data.get(&day);
-
             match day_index {
                 Some(_) => {
                     // see if the recorded most recent monday is the same as the current most recent monday

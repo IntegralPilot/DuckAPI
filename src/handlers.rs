@@ -26,7 +26,7 @@ use user_operations::create_user;
 
 use self::request_guards::header_filtering::agent_information::DuckPoweredAuthInfo;
 use self::secure_operations::password_handling::{
-    change_password, test_if_password_meets_requirements,
+    change_password, test_if_password_meets_requirements, verify_password,
 };
 
 use self::secure_operations::tokens::{
@@ -35,14 +35,13 @@ use self::secure_operations::tokens::{
 };
 
 use self::types::internal_types::DeviceInformation;
+use self::types::recieveable_types::DeleteAccountProps;
 use self::types::sendable_types::GenericAPIResponse;
 use self::user_operations::{
-    alter_notification_read_status, change_username, collate_user_information_public, delete_user,
-    get_user_id_from_friend_code, get_user_info_from_username, insert_into_device_ps_data,
-    remove_friend, test_if_username_meets_requirements, write_user_info_to_file,
+    alter_notification_read_status, change_username, collate_user_information_public, delete_user, generate_notification, get_user_id_from_friend_code, get_user_info_from_username, insert_into_device_ps_data, remove_friend, test_if_username_meets_requirements, write_user_info_to_file
 };
 use crate::handlers::types::recieveable_types::CreateAccountProps;
-use crate::handlers::user_operations::increment_times;
+use crate::handlers::user_operations::{get_user_info_from_id, increment_times};
 
 macro_rules! generate_response {
     ($status:expr, $response:expr) => {
@@ -184,47 +183,53 @@ pub async fn login_route(props: Json<LoginProps>) -> status::Custom<content::Raw
             }
         }
     };
-    // map each of the props.requested_scopes into a DuckPoweredTokenScope
-    let mut new_scopes = vec![];
-    for scope in props.requested_scopes.iter() {
-        match DuckPoweredTokenScope::from_str(scope) {
-            Ok(s) => new_scopes.push(s),
-            Err(_) => {
-                generate_response!(
-                    Status::BadRequest,
+    // check that the password is correct
+    match verify_password(
+        props.password.as_str(),
+        user_information.salt.as_str(),
+        user_information.password_hashed.as_str(),
+    )
+    .await
+    {
+        true => {
+            // 1 year from now, in mills since unix epoch
+            let expiry: u64 = (chrono::Utc::now() + chrono::Duration::days(365))
+                .timestamp_millis()
+                .try_into()
+                .unwrap();
+            let mut scopes = vec![];
+            for scope in props.requested_scopes.iter() {
+                scopes.push(DuckPoweredTokenScope::from_str(scope.as_str()).unwrap());
+            }
+            let scopes = DuckPoweredTokenScopes(scopes);
+            let token = DuckPoweredAuthClaim {
+                token_type: DuckPoweredTokenType::Refresh,
+                for_uid: user_information.user_id,
+                scopes: scopes,
+                user_secret: user_information.secret,
+                valid_until: expiry,
+            };
+            match create_token(token) {
+                Ok(t) => generate_response!(
+                    Status::Ok,
                     GenericAPIResponse {
-                        message: "Invalid scope requested.".to_string(),
+                        message: t,
+                        error: false,
+                    }
+                ),
+                Err(e) => generate_response!(
+                    Status::InternalServerError,
+                    GenericAPIResponse {
+                        message: format!("Internal Server Error: {:?}", e),
                         error: true,
                     }
-                );
+                ),
             }
         }
-    }
-    let scopes: DuckPoweredTokenScopes = DuckPoweredTokenScopes(new_scopes);
-    // 1 year from now, in mills since unix epoch
-    let expiry: u64 = (chrono::Utc::now() + chrono::Duration::days(365))
-        .timestamp_millis()
-        .try_into()
-        .unwrap();
-    let token = DuckPoweredAuthClaim {
-        token_type: DuckPoweredTokenType::Refresh,
-        for_uid: user_information.user_id,
-        scopes,
-        user_secret: user_information.secret,
-        valid_until: expiry,
-    };
-    match create_token(token) {
-        Ok(t) => generate_response!(
-            Status::Ok,
+        false => generate_response!(
+            Status::Unauthorized,
             GenericAPIResponse {
-                message: t,
-                error: false,
-            }
-        ),
-        Err(e) => generate_response!(
-            Status::InternalServerError,
-            GenericAPIResponse {
-                message: format!("Internal Server Error: {:?}", e),
+                message: "The password is incorrect.".to_string(),
                 error: true,
             }
         ),
@@ -363,6 +368,18 @@ pub async fn create_device_route(
             }
         );
     }
+    // see if the user already has a device with that name
+    for device in auth.user_info.devices.iter() {
+        if device.device_name == name {
+            generate_response!(
+                Status::Conflict,
+                GenericAPIResponse {
+                    message: "A device with that name already exists.".to_string(),
+                    error: true,
+                }
+            );
+        }
+    }
     let info = auth.user_info;
     let mut new_info = info.clone();
     let device_id = rng_alphanumeric(16).await;
@@ -427,6 +444,24 @@ pub async fn update_device_name_route(
                 error: true,
             }
         );
+    }
+    // check if there are now duplicate device names
+    for device in new_info.devices.iter() {
+        let mut count = 0;
+        for other_device in new_info.devices.iter() {
+            if device.device_name == other_device.device_name {
+                count += 1;
+            }
+        }
+        if count > 1 {
+            generate_response!(
+                Status::Conflict,
+                GenericAPIResponse {
+                    message: "A device with that name already exists.".to_string(),
+                    error: true,
+                }
+            );
+        }
     }
     match write_user_info_to_file(new_info, false).await {
         Ok(_) => generate_response!(
@@ -516,6 +551,23 @@ pub async fn destroy_device_route(
         );
     }
     let info = auth.user_info;
+    // see if the user has a device with that id
+    let mut found = false;
+    for device in info.devices.iter() {
+        if device.device_id == device_id {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        generate_response!(
+            Status::NotFound,
+            GenericAPIResponse {
+                message: "Device not found.".to_string(),
+                error: true,
+            }
+        );
+    }
     let mut new_info = info.clone();
     new_info.devices.retain(|d| d.device_id != device_id);
     match write_user_info_to_file(new_info, false).await {
@@ -578,7 +630,7 @@ pub async fn increment_number_of_dau_background() -> status::Custom<content::Raw
 
 #[delete("/userInfo/self", format = "json", data = "<props>")]
 pub async fn destroy_account_route(
-    props: Json<LoginProps>,
+    props: Json<DeleteAccountProps>,
 ) -> status::Custom<content::RawJson<String>> {
     let user_information = match get_user_info_from_username(props.username.as_str()).await {
         Ok(info) => info,
@@ -602,6 +654,23 @@ pub async fn destroy_account_route(
             }
         }
     };
+
+    match verify_password(
+        props.password.as_str(),
+        user_information.salt.as_str(),
+        user_information.password_hashed.as_str(),
+    )
+    .await
+    {
+        false => generate_response!(
+            Status::Unauthorized,
+            GenericAPIResponse {
+                message: "The password is incorrect.".to_string(),
+                error: true,
+            }
+        ),
+        true => {}
+    }
 
     match delete_user(user_information, props.password.clone()).await {
         Ok(_) => generate_response!(
@@ -637,7 +706,7 @@ pub async fn destroy_account_route(
 pub async fn user_information_collator_route(
     auth: DuckPoweredAuthInfo,
 ) -> status::Custom<content::RawJson<String>> {
-    match collate_user_information_public(auth.claim.for_uid, false).await {
+    match collate_user_information_public(auth.claim.for_uid).await {
         Ok(i) => {
             let mut new_i = i.clone();
             // redact any info that shouldn't be sent to the client, based on the claimed scopes
@@ -830,20 +899,64 @@ pub async fn friend_adder_route(
             }
         );
     }
+    // see if the user already has a friend with that code
+    for friend in auth.user_info.friends.iter() {
+       match get_user_info_from_id(friend.owner_id.as_str()).await {
+           Ok(friend_info) => {
+               if friend_info.friend_code == code {
+                   generate_response!(
+                       Status::Conflict,
+                       GenericAPIResponse {
+                           message: "You already have that friend.".to_string(),
+                           error: true,
+                       }
+                   );
+               }
+           },
+           Err(_) => {}
+       }
+    }
     match get_user_id_from_friend_code(code.as_str()).await {
         Ok(friends_id) => {
             let mut edited_user_info = auth.user_info.clone();
             edited_user_info.friends.push(UsernameMap {
-                owner_id: friends_id,
+                owner_id: friends_id.clone(),
             });
             match write_user_info_to_file(edited_user_info, false).await {
-                Ok(_) => generate_response!(
-                    Status::Ok,
-                    GenericAPIResponse {
-                        message: "Friend added.".to_string(),
-                        error: false,
+                Ok(_) => {
+                    // now add yourself to the other user's friends
+                    let friends_id_clone = friends_id.clone();
+                    match get_user_info_from_id(friends_id_clone.as_str()).await {
+                        Ok(mut other_user_info) => {
+                            other_user_info.friends.push(UsernameMap {
+                                owner_id: auth.user_info.user_id.clone(),
+                            });
+                            match write_user_info_to_file(other_user_info, false).await {
+                                Ok(_) => generate_response!(
+                                    Status::Ok,
+                                    GenericAPIResponse {
+                                        message: "Friend added.".to_string(),
+                                        error: false,
+                                    }
+                                ),
+                                Err(e) => generate_response!(
+                                    Status::InternalServerError,
+                                    GenericAPIResponse {
+                                        message: format!("Internal Server Error: {:?}", e),
+                                        error: true,
+                                    }
+                                ),
+                            }
+                        }
+                        Err(e) => generate_response!(
+                            Status::InternalServerError,
+                            GenericAPIResponse {
+                                message: format!("Internal Server Error: {:?}", e),
+                                error: true,
+                            }
+                        ),
                     }
-                ),
+                }
                 Err(e) => generate_response!(
                     Status::InternalServerError,
                     GenericAPIResponse {
@@ -921,6 +1034,51 @@ pub async fn friend_remover_route(
                     }
                 );
             }
+        }
+    }
+}
+
+#[get("/notification/new")]
+pub async fn new_notification_route(
+    auth: DuckPoweredAuthInfo
+) -> status::Custom<content::RawJson<String>> {
+    if !auth.claim.scopes.0.contains(&DuckPoweredTokenScope::NotificationsWrite) {
+        generate_response!(
+            Status::Forbidden,
+            GenericAPIResponse {
+                message: "Insufficient permissions.".to_string(),
+                error: true,
+            }
+        );
+    }
+
+    match generate_notification(auth.user_info).await {
+        Ok(new_info) => {
+            match write_user_info_to_file(new_info, false).await {
+                Ok(_) => generate_response!(
+                    Status::Ok,
+                    GenericAPIResponse {
+                        message: "Notification generated.".to_string(),
+                        error: false,
+                    }
+                ),
+                Err(e) => generate_response!(
+                    Status::InternalServerError,
+                    GenericAPIResponse {
+                        message: format!("Internal Server Error: {:?}", e),
+                        error: true,
+                    }
+                ),
+            }
+        },
+        Err(e) => {
+            generate_response!(
+                Status::InternalServerError,
+                GenericAPIResponse {
+                    message: format!("Internal Server Error: {:?}", e),
+                    error: true,
+                }
+            )
         }
     }
 }
